@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 from deerflow.agents.memory.prompt import format_conversation_for_update
-from deerflow.agents.memory.updater import MemoryUpdater, _extract_text, _parse_json_with_repair
+from deerflow.agents.memory.updater import MemoryUpdater, _extract_text
 from deerflow.config.memory_config import MemoryConfig
 
 
@@ -288,55 +288,213 @@ class TestUpdateMemoryStructuredResponse:
         assert result is True
 
 
-class TestParseJsonWithRepair:
-    """Layered JSON repair should handle common LLM malformed JSON."""
+import json
 
-    def test_valid_json_passes_through(self):
-        text = '{"key": "value", "count": 42}'
-        result = _parse_json_with_repair(text)
-        assert result == {"key": "value", "count": 42}
+import pytest
 
-    def test_trailing_comma_repaired(self):
-        text = '{"key": "value", "count": 42,}'
-        result = _parse_json_with_repair(text)
-        assert result == {"key": "value", "count": 42}
+from deerflow.agents.memory.updater import _parse_json_with_repair
 
-    def test_missing_closing_brace_repaired(self):
-        text = '{"key": "value"'
-        result = _parse_json_with_repair(text)
+
+class TestParseJsonWithRepairBasic:
+    """Basic valid JSON should pass through unchanged."""
+
+    def test_simple_valid_json(self):
+        result = _parse_json_with_repair('{"key": "value"}')
         assert result == {"key": "value"}
 
-    def test_explanatory_text_before_json(self):
-        text = 'Here is the result:\n{"key": "value"}'
+    def test_nested_valid_json(self):
+        text = '{"user": {"workContext": {"summary": "test"}}, "newFacts": []}'
         result = _parse_json_with_repair(text)
+        assert result["user"]["workContext"]["summary"] == "test"
+        assert result["newFacts"] == []
+
+    def test_json_with_numbers(self):
+        result = _parse_json_with_repair('{"count": 42, "rate": 0.95}')
+        assert result["count"] == 42
+        assert result["rate"] == 0.95
+
+    def test_json_with_booleans_and_null(self):
+        result = _parse_json_with_repair('{"active": true, "deleted": false, "parent": null}')
+        assert result["active"] is True
+        assert result["deleted"] is False
+        assert result["parent"] is None
+
+    def test_json_with_empty_strings(self):
+        result = _parse_json_with_repair('{"name": "", "value": ""}')
+        assert result["name"] == ""
+        assert result["value"] == ""
+
+    def test_json_with_unicode(self):
+        result = _parse_json_with_repair('{"name": "José", "emoji": "🎉"}')
+        assert result["name"] == "José"
+        assert result["emoji"] == "🎉"
+
+
+class TestParseJsonWithRepairSyntaxErrors:
+    """Common LLM JSON syntax errors should be repaired."""
+
+    def test_trailing_comma_in_object(self):
+        result = _parse_json_with_repair('{"key": "value",}')
         assert result == {"key": "value"}
 
-    def test_explanatory_text_after_json(self):
-        text = '{"key": "value"}\nHope this helps!'
-        result = _parse_json_with_repair(text)
+    def test_trailing_comma_in_nested_object(self):
+        result = _parse_json_with_repair('{"user": {"name": "test",},}')
+        assert result["user"]["name"] == "test"
+
+    def test_trailing_comma_in_array(self):
+        result = _parse_json_with_repair('{"items": ["a", "b", "c",]}')
+        assert result["items"] == ["a", "b", "c"]
+
+    def test_single_quotes_instead_of_double(self):
+        result = _parse_json_with_repair("{'key': 'value'}")
         assert result == {"key": "value"}
 
-    def test_markdown_code_fence_stripped(self):
-        text = '```json\n{"key": "value"}\n```'
-        result = _parse_json_with_repair(text)
+    def test_unquoted_keys(self):
+        result = _parse_json_with_repair('{key: "value"}')
         assert result == {"key": "value"}
 
-    def test_non_dict_raises_error(self):
-        text = '"just a string"'
-        import json
+    def test_missing_closing_brace(self):
+        result = _parse_json_with_repair('{"key": "value"')
+        assert result == {"key": "value"}
 
-        try:
-            _parse_json_with_repair(text)
-            assert False, "Should raise JSONDecodeError"
-        except json.JSONDecodeError:
-            pass
+    def test_missing_opening_brace(self):
+        text = 'json {"key": "value"}'
+        result = _parse_json_with_repair(text)
+        assert result["key"] == "value"
 
-    def test_completely_invalid_raises_error(self):
-        text = "not json at all!"
-        import json
+    def test_text_wrapped_json(self):
+        text = 'The result is: {"key": "value"} end.'
+        result = _parse_json_with_repair(text)
+        assert result["key"] == "value"
 
-        try:
-            _parse_json_with_repair(text)
-            assert False, "Should raise JSONDecodeError"
-        except json.JSONDecodeError:
-            pass
+
+class TestParseJsonWithRepairExplanatoryText:
+    """LLM often adds text before/after JSON."""
+
+    def test_text_before_json(self):
+        result = _parse_json_with_repair('Here is the result:\n{"key": "value"}')
+        assert result == {"key": "value"}
+
+    def test_text_after_json(self):
+        result = _parse_json_with_repair('{"key": "value"}\nHope this helps!')
+        assert result == {"key": "value"}
+
+    def test_text_before_and_after(self):
+        result = _parse_json_with_repair('Result:\n{"key": "value"}\nDone.')
+        assert result == {"key": "value"}
+
+    def test_markdown_code_fence_json(self):
+        result = _parse_json_with_repair('```json\n{"key": "value"}\n```')
+        assert result == {"key": "value"}
+
+    def test_markdown_code_fence_no_lang(self):
+        result = _parse_json_with_repair('```\n{"key": "value"}\n```')
+        assert result == {"key": "value"}
+
+    def test_think_tags_then_json(self):
+        result = _parse_json_with_repair('<think>analyzing...</think>\n{"key": "value"}')
+        assert result == {"key": "value"}
+
+
+class TestParseJsonWithRepairEdgeCases:
+    """Edge cases that can break JSON parsers."""
+
+    def test_empty_string_raises(self):
+        with pytest.raises(json.JSONDecodeError):
+            _parse_json_with_repair("")
+
+    def test_only_whitespace_raises(self):
+        with pytest.raises(json.JSONDecodeError):
+            _parse_json_with_repair("   \n  \t  ")
+
+    def test_non_json_string_raises(self):
+        with pytest.raises(json.JSONDecodeError):
+            _parse_json_with_repair("not json at all")
+
+    def test_json_array_with_single_object_extracts(self):
+        result = _parse_json_with_repair('[{"key": "value"}]')
+        assert result["key"] == "value"
+
+    def test_json_number_raises(self):
+        with pytest.raises(json.JSONDecodeError):
+            _parse_json_with_repair("42")
+
+    def test_json_string_raises(self):
+        with pytest.raises(json.JSONDecodeError):
+            _parse_json_with_repair('"just a string"')
+
+    def test_json_null_raises(self):
+        with pytest.raises(json.JSONDecodeError):
+            _parse_json_with_repair("null")
+
+    def test_json_true_raises(self):
+        with pytest.raises(json.JSONDecodeError):
+            _parse_json_with_repair("true")
+
+    def test_very_long_value(self):
+        long_value = "a" * 10000
+        result = _parse_json_with_repair(f'{{"data": "{long_value}"}}')
+        assert result["data"] == long_value
+
+    def test_deeply_nested_json(self):
+        text = '{"a": {"b": {"c": {"d": {"e": "deep"}}}}}'
+        result = _parse_json_with_repair(text)
+        assert result["a"]["b"]["c"]["d"]["e"] == "deep"
+
+    def test_json_with_escaped_quotes_in_string(self):
+        result = _parse_json_with_repair(r'{"msg": "He said \"hello\""}')
+        assert result["msg"] == 'He said "hello"'
+
+    def test_json_with_newline_in_string(self):
+        result = _parse_json_with_repair('{"msg": "line1\\nline2"}')
+        assert result["msg"] == "line1\nline2"
+
+    def test_json_with_tab_in_string(self):
+        result = _parse_json_with_repair('{"msg": "col1\\tcol2"}')
+        assert result["msg"] == "col1\tcol2"
+
+
+from unittest.mock import patch
+
+from deerflow.agents.memory.updater import _try_llm_repair
+
+
+class TestTryLlmRepair:
+    """LLM-based repair should handle cases json_repair can't fix."""
+
+    def test_returns_none_when_disabled(self):
+        with patch("deerflow.agents.memory.updater.get_memory_config") as mock_cfg:
+            mock_cfg.return_value.repair_model = None
+            assert _try_llm_repair("broken") is None
+
+    def test_returns_none_when_model_fails(self):
+        with (
+            patch("deerflow.agents.memory.updater.get_memory_config") as mock_cfg,
+            patch("deerflow.agents.memory.updater.create_chat_model") as mock_model,
+        ):
+            mock_cfg.return_value.repair_model = "nemotron-mini-repair"
+            mock_model.return_value.invoke.side_effect = Exception("API error")
+            assert _try_llm_repair("broken json") is None
+
+    def test_returns_repaired_json_on_success(self):
+        with (
+            patch("deerflow.agents.memory.updater.get_memory_config") as mock_cfg,
+            patch("deerflow.agents.memory.updater.create_chat_model") as mock_model,
+        ):
+            mock_cfg.return_value.repair_model = "nemotron-mini-repair"
+            mock_response = MagicMock()
+            mock_response.content = '{"key": "value"}'
+            mock_model.return_value.invoke.return_value = mock_response
+            result = _try_llm_repair("some broken json")
+            assert result == {"key": "value"}
+
+    def test_returns_none_if_llm_returns_non_dict(self):
+        with (
+            patch("deerflow.agents.memory.updater.get_memory_config") as mock_cfg,
+            patch("deerflow.agents.memory.updater.create_chat_model") as mock_model,
+        ):
+            mock_cfg.return_value.repair_model = "nemotron-mini-repair"
+            mock_response = MagicMock()
+            mock_response.content = "[1, 2, 3]"
+            mock_model.return_value.invoke.return_value = mock_response
+            assert _try_llm_repair("broken json") is None

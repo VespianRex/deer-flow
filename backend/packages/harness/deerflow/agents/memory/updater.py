@@ -19,11 +19,6 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_json_with_repair(text: str) -> dict[str, Any]:
-    """Parse JSON with layered repair fallbacks.
-
-    Tries direct parse, then json_repair library, then manual extraction.
-    Raises JSONDecodeError if all strategies fail.
-    """
     try:
         result = json.loads(text)
         if isinstance(result, dict):
@@ -31,33 +26,26 @@ def _parse_json_with_repair(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    try:
-        from json_repair import repair_json
+    from json_repair import repair_json
 
-        result = repair_json(text, return_objects=True)
-        if isinstance(result, dict):
-            logger.debug("JSON repaired via json_repair")
-            return result
-    except Exception:
-        pass
+    result = repair_json(text, return_objects=True)
+    if isinstance(result, dict):
+        return result
 
-    try:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidate = text[start : end + 1]
-            result = json.loads(candidate)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            result = json.loads(text[start : end + 1])
             if isinstance(result, dict):
-                logger.debug("JSON repaired via manual extraction")
                 return result
-    except Exception:
-        pass
+        except json.JSONDecodeError:
+            pass
 
-    raise json.JSONDecodeError("All JSON repair strategies failed", text, 0)
+    raise json.JSONDecodeError("JSON repair failed", text, 0)
 
 
 def _try_llm_repair(broken_json: str) -> dict[str, Any] | None:
-    """Return repaired JSON via LLM, or None if repair fails."""
     config = get_memory_config()
     repair_model_name = config.repair_model
     if not repair_model_name:
@@ -68,7 +56,8 @@ def _try_llm_repair(broken_json: str) -> dict[str, Any] | None:
         repair_prompt = f"Fix this malformed JSON. Return ONLY valid JSON, no explanation.\n\nInput:\n```\n{broken_json}\n```\n\nOutput:\n"
         response = model.invoke(repair_prompt)
         repaired_text = _extract_text(response.content).strip()
-        return json.loads(repaired_text)
+        result = json.loads(repaired_text)
+        return result if isinstance(result, dict) else None
     except Exception as e:
         logger.warning("LLM JSON repair failed: %s", e)
         return None
@@ -229,7 +218,7 @@ class MemoryUpdater:
                 lines = response_text.split("\n")
                 response_text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
 
-            update_data = _parse_json_with_repair(response_text)
+            update_data = json.loads(response_text)
 
             # Apply updates
             updated_memory = self._apply_updates(current_memory, update_data, thread_id)
