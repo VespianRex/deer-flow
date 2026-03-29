@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 from deerflow.agents.memory.prompt import format_conversation_for_update
-from deerflow.agents.memory.updater import MemoryUpdater, _extract_text
+from deerflow.agents.memory.updater import MemoryUpdater, _extract_text, _parse_json_with_repair
 from deerflow.config.memory_config import MemoryConfig
 
 
@@ -286,3 +286,57 @@ class TestUpdateMemoryStructuredResponse:
             result = updater.update_memory([msg, ai_msg])
 
         assert result is True
+
+
+class TestParseJsonWithRepair:
+    """Layered JSON repair should handle common LLM malformed JSON."""
+
+    def test_valid_json_passes_through(self):
+        text = '{"key": "value", "count": 42}'
+        result = _parse_json_with_repair(text)
+        assert result == {"key": "value", "count": 42}
+
+    def test_trailing_comma_repaired(self):
+        text = '{"key": "value", "count": 42,}'
+        result = _parse_json_with_repair(text)
+        assert result == {"key": "value", "count": 42}
+
+    def test_missing_closing_brace_repaired(self):
+        text = '{"key": "value"'
+        result = _parse_json_with_repair(text)
+        assert result == {"key": "value"}
+
+    def test_explanatory_text_before_json(self):
+        text = 'Here is the result:\n{"key": "value"}'
+        result = _parse_json_with_repair(text)
+        assert result == {"key": "value"}
+
+    def test_explanatory_text_after_json(self):
+        text = '{"key": "value"}\nHope this helps!'
+        result = _parse_json_with_repair(text)
+        assert result == {"key": "value"}
+
+    def test_markdown_code_fence_stripped(self):
+        text = '```json\n{"key": "value"}\n```'
+        result = _parse_json_with_repair(text)
+        assert result == {"key": "value"}
+
+    def test_non_dict_raises_error(self):
+        text = '"just a string"'
+        import json
+
+        try:
+            _parse_json_with_repair(text)
+            assert False, "Should raise JSONDecodeError"
+        except json.JSONDecodeError:
+            pass
+
+    def test_completely_invalid_raises_error(self):
+        text = "not json at all!"
+        import json
+
+        try:
+            _parse_json_with_repair(text)
+            assert False, "Should raise JSONDecodeError"
+        except json.JSONDecodeError:
+            pass

@@ -59,6 +59,10 @@ class MemoryConfig(BaseModel):
         le=8000,
         description="Maximum tokens to use for memory injection",
     )
+    repair_model: str | None = Field(
+        default="nemotron-mini-repair",
+        description="Model name for LLM-based JSON repair fallback (null to disable)",
+    )
 
 
 # Global configuration instance

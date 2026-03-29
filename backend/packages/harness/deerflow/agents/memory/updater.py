@@ -17,9 +17,67 @@ from deerflow.models import create_chat_model
 
 logger = logging.getLogger(__name__)
 
+
+def _parse_json_with_repair(text: str) -> dict[str, Any]:
+    """Parse JSON with layered repair fallbacks.
+
+    Tries direct parse, then json_repair library, then manual extraction.
+    Raises JSONDecodeError if all strategies fail.
+    """
+    try:
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        from json_repair import repair_json
+
+        result = repair_json(text, return_objects=True)
+        if isinstance(result, dict):
+            logger.debug("JSON repaired via json_repair")
+            return result
+    except Exception:
+        pass
+
+    try:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start : end + 1]
+            result = json.loads(candidate)
+            if isinstance(result, dict):
+                logger.debug("JSON repaired via manual extraction")
+                return result
+    except Exception:
+        pass
+
+    raise json.JSONDecodeError("All JSON repair strategies failed", text, 0)
+
+
+def _try_llm_repair(broken_json: str) -> dict[str, Any] | None:
+    """Return repaired JSON via LLM, or None if repair fails."""
+    config = get_memory_config()
+    repair_model_name = config.repair_model
+    if not repair_model_name:
+        return None
+
+    try:
+        model = create_chat_model(name=repair_model_name, thinking_enabled=False)
+        repair_prompt = f"Fix this malformed JSON. Return ONLY valid JSON, no explanation.\n\nInput:\n```\n{broken_json}\n```\n\nOutput:\n"
+        response = model.invoke(repair_prompt)
+        repaired_text = _extract_text(response.content).strip()
+        return json.loads(repaired_text)
+    except Exception as e:
+        logger.warning("LLM JSON repair failed: %s", e)
+        return None
+
+
 def get_memory_data(agent_name: str | None = None) -> dict[str, Any]:
     """Get the current memory data via storage provider."""
     return get_memory_storage().load(agent_name)
+
 
 def reload_memory_data(agent_name: str | None = None) -> dict[str, Any]:
     """Reload memory data via storage provider."""
@@ -171,7 +229,7 @@ class MemoryUpdater:
                 lines = response_text.split("\n")
                 response_text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
 
-            update_data = json.loads(response_text)
+            update_data = _parse_json_with_repair(response_text)
 
             # Apply updates
             updated_memory = self._apply_updates(current_memory, update_data, thread_id)
@@ -187,7 +245,12 @@ class MemoryUpdater:
 
         except json.JSONDecodeError as e:
             logger.warning("Failed to parse LLM response for memory update: %s", e)
-            return False
+            repaired = _try_llm_repair(response_text)
+            if repaired is None:
+                logger.error("JSON repair failed — response was: %s", response_text[:500])
+                return False
+            update_data = repaired
+            logger.info("JSON repaired via LLM fallback")
         except Exception as e:
             logger.exception("Memory update failed: %s", e)
             return False
